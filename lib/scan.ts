@@ -92,12 +92,22 @@ export function applyRedactions(text: string, findings: Finding[]): string {
   return out;
 }
 
-/** Stable short hash. Lets the admin see two pastes were identical, without storing either. */
-export function hashText(text: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(16).padStart(8, "0");
+/**
+ * One-way correlation hash: SHA-256, truncated for display.
+ *
+ * This lets an admin see that two pastes were identical without either being
+ * stored. It is NOT anonymisation. A hash of a short, low-entropy input (a
+ * single email address, say) can be recovered by guessing, and truncation
+ * raises the chance of collision. Treat a hash as pseudonymous at best, do
+ * not publish it, and do not reason about it as if the content were gone.
+ *
+ * Async because SubtleCrypto is async in both the browser and Node.
+ */
+export async function hashText(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }

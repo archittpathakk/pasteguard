@@ -1,9 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { scanAndScrub, applyRedactions, hashText } from "@/lib/scan";
-import { decide } from "@/lib/decide";
-import { CATEGORY_LABELS, type AlertEvent, type Decision, type Finding } from "@/lib/types";
+import { buildAlertPayload, runGuard } from "@/lib/guard";
+import type { AlertEvent, Decision, Finding } from "@/lib/types";
 
 const EXAMPLE_PASTE = `# staging .env - help me debug this
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
@@ -20,51 +19,100 @@ interface GuardResult {
   safeText: string;
 }
 
+interface AdminState {
+  /** True when the server refused the read because nobody has signed in. */
+  locked: boolean;
+  events: AlertEvent[];
+  /** The server tells us whether these events survive a restart. */
+  durable: boolean;
+  /** A configuration problem worth showing the operator. */
+  problem?: string;
+}
+
 export default function Home() {
   const [text, setText] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [result, setResult] = useState<GuardResult | null>(null);
-  const [events, setEvents] = useState<AlertEvent[]>([]);
+  const [admin, setAdmin] = useState<AdminState>({
+    locked: false,
+    events: [],
+    durable: false,
+  });
+  const [password, setPassword] = useState("");
+  const [unlockError, setUnlockError] = useState<string | null>(null);
   const [sent, setSent] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState<number | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runId = useRef(0);
 
-  const loadEvents = useCallback(async () => {
+  // Fetching is separated from state so the mount effect can drop a result
+  // that arrives after unmount, and so nothing calls setState in an effect body.
+  // Reads are authenticated server-side. A 401 here is expected, not an error:
+  // it means nobody has unlocked the admin view in this browser yet.
+  const fetchEvents = useCallback(async (): Promise<AdminState> => {
     try {
       const res = await fetch("/api/alert");
+      if (res.status === 401) return { locked: true, events: [], durable: false };
+      if (res.status === 503) {
+        const body = await res.json().catch(() => ({}));
+        return { locked: true, events: [], durable: false, problem: body?.error };
+      }
+      if (!res.ok) return { locked: false, events: [], durable: false };
       const data = await res.json();
-      setEvents(data.events ?? []);
+      return {
+        locked: false,
+        events: Array.isArray(data?.events) ? data.events : [],
+        durable: data?.durable === true,
+      };
     } catch {
-      /* the admin panel is not worth breaking the page over */
+      return { locked: false, events: [], durable: false };
     }
   }, []);
 
+  const loadEvents = useCallback(async () => {
+    setAdmin(await fetchEvents());
+  }, [fetchEvents]);
+
   useEffect(() => {
-    loadEvents();
-  }, [loadEvents]);
+    let cancelled = false;
+    void (async () => {
+      const initial = await fetchEvents();
+      if (!cancelled) setAdmin(initial);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchEvents]);
+
+  async function unlockAdmin(e: React.FormEvent) {
+    e.preventDefault();
+    setUnlockError(null);
+    const res = await fetch("/api/admin/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      setUnlockError(body?.error ?? "Could not sign in.");
+      return;
+    }
+    setPassword("");
+    await loadEvents();
+  }
 
   // One path for every admin event, so an override is recorded the same way
   // a block is. Metadata only - never the text itself.
   const postAlert = useCallback(
     async (findings: Finding[], action: Decision["action"], source: string, failed: boolean) => {
-      const counts: Record<string, number> = {};
-      for (const f of findings) {
-        counts[f.category] = (counts[f.category] ?? 0) + 1;
-      }
       try {
+        const payload = await buildAlertPayload(findings, action, source, failed);
         await fetch("/api/alert", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            action,
-            categories: [...new Set(findings.map((f) => f.category))],
-            counts,
-            hash: hashText(source),
-            classifierFailed: failed,
-          }),
+          body: JSON.stringify(payload),
         });
-        loadEvents();
+        await loadEvents();
       } catch {
         /* alerting must never block the user */
       }
@@ -72,7 +120,7 @@ export default function Home() {
     [loadEvents]
   );
 
-  const runGuard = useCallback(
+  const runCheck = useCallback(
     async (input: string) => {
       const id = ++runId.current;
       const started = performance.now();
@@ -86,45 +134,24 @@ export default function Home() {
       setStatus("checking");
       setSent(null);
 
-      // STEP 1 - local scan, in this browser. Secrets never leave the device.
-      const { scrubbed, findings: localFindings } = scanAndScrub(input);
-
-      // STEP 2 - ask Claude about what is left.
-      let classified: Finding[] = [];
-      let classifierFailed = false;
-      try {
-        const res = await fetch("/api/classify", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ scrubbed }),
-        });
-        if (!res.ok) throw new Error("classifier returned " + res.status);
-        const data = await res.json();
-        classified = (data.findings ?? []).map(
-          (f: Omit<Finding, "source" | "label">) => ({
-            ...f,
-            source: "ai" as const,
-            // Label from the category the classifier actually returned, so a
-            // leaked credential can't be reported as personal data.
-            label: CATEGORY_LABELS[f.category] ?? "SENSITIVE",
-          })
-        );
-      } catch {
-        classifierFailed = true; // fail closed - handled in decide()
-      }
+      // Scan locally, classify the scrubbed text, then decide by rule.
+      // The whole pipeline lives in lib/guard.ts so the tests exercise the
+      // same code this page runs - see tests/pre-egress.test.ts.
+      const out = await runGuard(input);
 
       if (id !== runId.current) return; // a newer keystroke won
 
-      // STEP 3 - fixed rules turn findings into an action.
-      const decision = decide(localFindings, classified, classifierFailed);
-      const safeText = applyRedactions(scrubbed, decision.redactions);
-
-      setResult({ decision, safeText });
+      setResult({ decision: out.decision, safeText: out.safeText });
       setStatus("done");
       setElapsed(Math.round(performance.now() - started));
 
-      // STEP 4 - tell the admin. Metadata only.
-      postAlert(decision.redactions, decision.action, input, classifierFailed);
+      // Tell the admin. Metadata only.
+      void postAlert(
+        out.decision.redactions,
+        out.decision.action,
+        input,
+        out.classifierFailed
+      );
     },
     [postAlert]
   );
@@ -147,7 +174,7 @@ export default function Home() {
   function onChange(value: string) {
     setText(value);
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => runGuard(value), 400);
+    timer.current = setTimeout(() => runCheck(value), 400);
   }
 
   const d = result?.decision;
@@ -171,7 +198,7 @@ export default function Home() {
           <button
             onClick={() => {
               setText(EXAMPLE_PASTE);
-              runGuard(EXAMPLE_PASTE);
+              runCheck(EXAMPLE_PASTE);
             }}
             className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 transition hover:bg-slate-800"
           >
@@ -303,13 +330,54 @@ export default function Home() {
               <span className="text-xs text-slate-600">metadata only</span>
             </div>
 
-            {events.length === 0 ? (
+            {!admin.locked && !admin.durable && admin.events.length > 0 && (
+              <p className="mb-2 rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+                Demo storage: these events are held in memory and are lost when
+                the server restarts. Not an audit trail yet.
+              </p>
+            )}
+
+            {admin.locked ? (
+              <form
+                onSubmit={unlockAdmin}
+                className="space-y-3 rounded-lg border border-slate-800 bg-slate-900 p-4"
+              >
+                <p className="text-sm text-slate-400">
+                  The event log is only readable after signing in. The server
+                  refuses it otherwise &mdash; hiding the panel would not be
+                  protection.
+                </p>
+                <label htmlFor="admin-password" className="sr-only">
+                  Admin password
+                </label>
+                <input
+                  id="admin-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Admin password"
+                  autoComplete="current-password"
+                  className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-slate-500"
+                />
+                <button
+                  type="submit"
+                  className="rounded-md bg-slate-700 px-3 py-1.5 text-sm font-medium transition hover:bg-slate-600"
+                >
+                  Unlock admin view
+                </button>
+                {(unlockError ?? admin.problem) && (
+                  <p role="alert" className="text-sm text-amber-300">
+                    {unlockError ?? admin.problem}
+                  </p>
+                )}
+              </form>
+            ) : admin.events.length === 0 ? (
               <p className="rounded-lg border border-dashed border-slate-800 p-4 text-sm text-slate-600">
                 No events yet.
               </p>
             ) : (
               <ul className="space-y-2">
-                {events.map((e) => (
+                {admin.events.map((e) => (
                   <li
                     key={e.id}
                     className="rounded-lg border border-slate-800 bg-slate-900 p-3 text-sm"
