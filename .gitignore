@@ -42,3 +42,5 @@ next-env.d.ts
 
 # ...but the example file carries no secrets and should be committed.
 !.env.example
+
+.vercel
