@@ -17,14 +17,36 @@ const DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5";
 
 export class ClassifierUnavailable extends Error {}
 
+/**
+ * A missing key is the most common setup failure, and "not set" alone doesn't
+ * say where to set it. This reports which variable NAMES the server can see -
+ * never their values - and gives the fix for wherever it is running.
+ */
+function missingKeyMessage(varName: string): string {
+  const visible = (
+    [
+      "AI_PROVIDER",
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "ANTHROPIC_API_KEY",
+    ] as const
+  ).filter((name) => Boolean(process.env[name]));
+
+  const where = process.env.VERCEL
+    ? "On Vercel: Settings -> Environment Variables -> add it with the Production box ticked -> then Deployments -> Redeploy. Environment variables only reach a build created AFTER they were added, so adding one without redeploying changes nothing."
+    : "Locally: add it to .env.local in the project root, then restart the dev server.";
+
+  return `${varName} is not set. ${where} Variables the server can currently see: ${
+    visible.length ? visible.join(", ") : "none of the expected ones"
+  }.`;
+}
+
 export function getClassifier(): Classifier {
   const provider = (process.env.AI_PROVIDER ?? "gemini").toLowerCase().trim();
 
   if (provider === "anthropic" || provider === "claude") {
     if (!process.env.ANTHROPIC_API_KEY) {
-      throw new ClassifierUnavailable(
-        "AI_PROVIDER is anthropic but ANTHROPIC_API_KEY is not set in .env.local"
-      );
+      throw new ClassifierUnavailable(missingKeyMessage("ANTHROPIC_API_KEY"));
     }
     return anthropicClassifier(
       process.env.ANTHROPIC_MODEL ?? DEFAULT_ANTHROPIC_MODEL
@@ -34,9 +56,7 @@ export function getClassifier(): Classifier {
   if (provider === "gemini" || provider === "google") {
     const key = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
     if (!key) {
-      throw new ClassifierUnavailable(
-        "AI_PROVIDER is gemini but GEMINI_API_KEY is not set in .env.local"
-      );
+      throw new ClassifierUnavailable(missingKeyMessage("GEMINI_API_KEY"));
     }
     return geminiClassifier(key, process.env.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL);
   }
